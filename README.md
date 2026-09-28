@@ -8,13 +8,110 @@ This project trains and evaluates sequence-labeling models for the DiMSUM task. 
 - official DiMSUM evaluation
 - automatic report generation for analysis
 
+## Quick start
+
+These instructions set up the corrected CRF implementation and the Python 3-compatible
+DiMSUM evaluator. Run all commands from a terminal opened at the project root.
+
+### Get the code and data
+
+```bash
+git clone https://github.com/samuski/DiMSUM.git
+cd DiMSUM
+git clone --branch python3-compat https://github.com/samuski/dimsum-data.git
+```
+
+The `python3-compat` data branch contains the official DiMSUM data and a targeted
+Python 3 port of its evaluation/conversion scripts. No separate evaluator patch is
+needed when using that branch. Once the upstream Python 3 pull request is merged,
+the official `dimsum16/dimsum-data` repository can be used directly instead.
+
+### Option 1: local virtual environment
+
+Python 3.11 is recommended because it matches the Docker image. On Windows
+PowerShell:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install torch --index-url https://download.pytorch.org/whl/cu121
+python -m pip install -r requirements.txt
+```
+
+On macOS or Linux:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+python -m pip install -r requirements.txt
+```
+
+The Windows example installs the CUDA 12.1 PyTorch build used by this project's
+Dockerfile. For a CPU-only Windows machine, replace `cu121` with `cpu`. For a
+different CUDA setup, install the matching PyTorch build before installing
+`requirements.txt`.
+
+Confirm that the project and evaluator work with a short CPU smoke test:
+
+```bash
+python dimsum_unified.py --data_dir ./dimsum-data --eval_file ./dimsum-data/scripts/dimsumeval.py --quick_cpu
+```
+
+### Option 2: Docker with an NVIDIA GPU
+
+Docker Desktop must have GPU access through WSL2, and the host must have compatible
+NVIDIA drivers.
+
+```bash
+docker compose build
+docker compose run --rm dimsum python -c "import torch; print('CUDA:', torch.cuda.is_available()); print('GPU:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'none')"
+```
+
+The second command should report `CUDA: True`. The project directory is mounted at
+`/workspace`, so models and reports written inside the container also appear on the
+host.
+
+### Train the corrected DeBERTa CRF model
+
+With the virtual environment activated:
+
+```bash
+python dimsum_unified.py --data_dir ./dimsum-data --eval_file ./dimsum-data/scripts/dimsumeval.py --model_name microsoft/deberta-v3-small --architecture mtl_crf --epochs 15 --batch_size 16 --lr 2e-5 --mwe_loss_weight 3 --sup_loss_weight 2
+```
+
+Or run the same command through Docker:
+
+```bash
+docker compose run --rm dimsum python dimsum_unified.py --data_dir ./dimsum-data --eval_file ./dimsum-data/scripts/dimsumeval.py --model_name microsoft/deberta-v3-small --architecture mtl_crf --epochs 15 --batch_size 16 --lr 2e-5 --mwe_loss_weight 3 --sup_loss_weight 2
+```
+
+The run writes its checkpoint, predictions, training summary, and official evaluation
+under:
+
+```text
+runs/mtl_crf_microsoft__deberta-v3-small_lr2e-05_ep15_bs16/
+```
+
+Generate the analysis report afterward:
+
+```bash
+python dimsum_report.py --run_dir runs/mtl_crf_microsoft__deberta-v3-small_lr2e-05_ep15_bs16
+```
+
+For Docker, prefix that report command with `docker compose run --rm dimsum`.
+Training can vary slightly across hardware even though the program uses a fixed
+random seed.
+
 The main project files are expected to be:
 
 ```text
 your-project/
   dimsum_unified.py
   dimsum_report.py
-  requirements-dimsum.txt
+  requirements.txt
   Dockerfile
   docker-compose.yml
   dimsum-data/
@@ -261,7 +358,7 @@ Use this for quick CPU tests, non-Docker debugging, or teammates who do not want
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-pip install -r requirements-dimsum.txt
+pip install -r requirements.txt
 ```
 
 ### macOS / Linux
@@ -270,7 +367,7 @@ pip install -r requirements-dimsum.txt
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-pip install -r requirements-dimsum.txt
+pip install -r requirements.txt
 ```
 
 ## Quick CPU smoke test
@@ -503,7 +600,7 @@ python -m venv .venv
 source .venv/bin/activate  # macOS/Linux
 # or .\.venv\Scripts\Activate.ps1 on Windows PowerShell
 
-pip install -r requirements-dimsum.txt
+pip install -r requirements.txt
 git clone https://github.com/dimsum16/dimsum-data.git
 # run evaluator patch once
 
