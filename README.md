@@ -89,17 +89,63 @@ docker compose run --rm dimsum python dimsum_unified.py --data_dir ./dimsum-data
 ```
 
 The run writes its checkpoint, predictions, training summary, and official evaluation
-under:
+under (the folder name now includes the seed, so runs with different seeds do not
+overwrite each other):
 
 ```text
-runs/mtl_crf_microsoft__deberta-v3-small_lr2e-05_ep15_bs16/
+runs/mtl_crf_microsoft__deberta-v3-small_lr2e-05_ep15_bs16_seed42/
 ```
 
 Generate the analysis report afterward:
 
 ```bash
-python dimsum_report.py --run_dir runs/mtl_crf_microsoft__deberta-v3-small_lr2e-05_ep15_bs16
+python dimsum_report.py --run_dir runs/mtl_crf_microsoft__deberta-v3-small_lr2e-05_ep15_bs16_seed42
 ```
+
+### Gappy-MWE experiment: B, B+c, G
+
+Three conditions share the encoder, data split, seed, optimizer and supersense head;
+only the MWE output differs.
+
+| Condition | Flags | MWE output |
+|---|---|---|
+| B | `--architecture mtl_crf` | CRF over the 6 DiMSUM tags (existing model) |
+| B+c | `--architecture mtl_crf --constrained_decoding` | Same CRF; Viterbi restricted to valid tag sequences |
+| G | `--architecture mtl_parent` | Parent selection: each word scores every preceding word as its MWE parent (DiMSUM column 6) or "none"; chains are decoded under DiMSUM's structural constraints and converted back to tags |
+
+Run all three with the same settings (30 epochs; the best epoch is chosen on dev):
+
+```bash
+COMMON="--data_dir ./dimsum-data --eval_file ./dimsum-data/scripts/dimsumeval.py --model_name microsoft/deberta-v3-small --epochs 30 --batch_size 16 --lr 2e-5 --mwe_loss_weight 3 --sup_loss_weight 2 --seed 42"
+python dimsum_unified.py $COMMON --architecture mtl_crf
+python dimsum_unified.py $COMMON --architecture mtl_crf --constrained_decoding
+python dimsum_unified.py $COMMON --architecture mtl_parent
+```
+
+Before the full runs, `python test_decoding.py` (CPU, about a minute, needs `torch` and
+`pytorch-crf`) checks the decoders and the group scorer against the gold data.
+
+What changed in training and evaluation:
+
+- **Dev checkpoint selection (all conditions).** After every epoch the dev split is
+  scored with the official evaluator. The checkpoint with the highest dev combined F is
+  kept (ties: higher dev supersense F, then the earlier epoch), and only that checkpoint
+  is evaluated on test. Per-epoch dev scores are in `loss_history.csv` and
+  `summary.json`. `--no_dev_selection` restores the old behavior (final epoch).
+- **Exact-group scores.** `group_eval.json` (from `gappy_eval.py`) gives gappy and
+  contiguous MWE precision/recall/F1 with raw TP/FP/FN, counting a predicted group as
+  correct only if its token set exactly matches a gold group. It can also be run on any
+  existing prediction file:
+  `python gappy_eval.py dimsum-data/dimsum16.test runs/<run>/predictions.pred`
+- **Diagnostics in `summary.json`.** `invalid_mwe_sentences_before_repair` counts test
+  sentences whose raw MWE tags were invalid before `clean_mwe_tags` repaired them.
+  For G, `parent_decoding` summarizes unconstrained vs final links, cross-gap links,
+  the "none" rate, and links removed by each constraint; `parent_decode_log.jsonl`
+  has the per-sentence detail (unconstrained parents, final parents, removed links
+  with score margins).
+- **Prediction writer.** Tokens beyond `--max_len` (truncated sentences) are now
+  written as unpredicted instead of copying the gold columns. With DeBERTa-v3 at
+  `--max_len 128` no DiMSUM sentence is truncated, so earlier results are unaffected.
 
 For Docker, prefix that report command with `docker compose run --rm dimsum`.
 Training can vary slightly across hardware even though the program uses a fixed

@@ -29,6 +29,7 @@ import os
 import random
 import re
 import subprocess
+import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -51,7 +52,24 @@ try:
 except Exception:  # pragma: no cover
     f1_score = None
 
-Sentence = List[Tuple[str, str, Optional[str]]]
+# (word, mwe_tag, supersense, mwe_parent) where mwe_parent is the 1-based index
+# of the nearest preceding token of the same MWE (DiMSUM column 6), or 0.
+Sentence = List[Tuple[str, str, Optional[str], int]]
+
+# DiMSUM 6-tag MWE scheme (no strength distinction): B/I = outer expression,
+# b/i = expression inside a gap, o = single word inside a gap, O = outside.
+# Valid tag bigrams for constrained decoding (cf. Schneider et al. 2014;
+# every bigram observed in dimsum16.train and dimsum16.test is in this set).
+MWE_ALLOWED_NEXT = {
+    "O": {"O", "B"},
+    "B": {"I", "o", "b"},
+    "I": {"O", "B", "I", "o", "b"},
+    "o": {"o", "b", "I"},
+    "b": {"i"},
+    "i": {"i", "o", "b", "I"},
+}
+MWE_ALLOWED_START = {"O", "B"}
+MWE_ALLOWED_END = {"O", "I"}
 
 
 def set_seed(seed: int) -> None:
@@ -97,11 +115,42 @@ def parse_dimsum_file(file_path: Path) -> List[Sentence]:
             word = cols[1]
             mwe_tag = cols[4] if cols[4] else "O"
             sup_tag = cols[7].strip() if len(cols) > 7 and cols[7].strip() else None
-            current.append((word, mwe_tag, sup_tag))
+            parent = int(cols[5]) if len(cols) > 5 and cols[5].strip().isdigit() else 0
+            current.append((word, mwe_tag, sup_tag, parent))
 
     if current:
         sentences.append(current)
     return sentences
+
+
+def parse_dimsum_raw(file_path: Path) -> List[List[str]]:
+    """Raw token lines per sentence, using the same filtering as parse_dimsum_file
+    so that index k refers to the same sentence in both."""
+    blocks: List[List[str]] = []
+    current: List[str] = []
+    with file_path.open("r", encoding="utf-8") as f:
+        for raw_line in f:
+            line = raw_line.rstrip("\n")
+            if not line.strip():
+                if current:
+                    blocks.append(current)
+                    current = []
+                continue
+            if len(line.split("\t")) < 5:
+                continue
+            current.append(line)
+    if current:
+        blocks.append(current)
+    return blocks
+
+
+def write_dimsum_raw(blocks: Sequence[Sequence[str]], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        for block in blocks:
+            for line in block:
+                f.write(line + "\n")
+            f.write("\n")
 
 
 def build_vocabs(train_data: Sequence[Sentence]) -> Tuple[Dict[str, int], Dict[str, int]]:
@@ -109,7 +158,7 @@ def build_vocabs(train_data: Sequence[Sentence]) -> Tuple[Dict[str, int], Dict[s
     mwe_vocab = {"O"}
     sup_vocab = {"O"}
     for sentence in train_data:
-        for _, mwe, sup in sentence:
+        for _, mwe, sup, _parent in sentence:
             mwe_vocab.add(mwe if mwe else "O")
             if sup:
                 sup_vocab.add(sup)
@@ -138,6 +187,7 @@ class DiMSUMDataset(Dataset):
         words = [x[0] for x in sentence]
         mwe_tags = [x[1] for x in sentence]
         sup_tags = [x[2] for x in sentence]
+        parents = [x[3] if len(x) > 3 else 0 for x in sentence]
 
         encoding = self.tokenizer(
             words,
@@ -152,22 +202,35 @@ class DiMSUMDataset(Dataset):
         mwe_label_ids: List[int] = []
         sup_label_ids: List[int] = []
         first_subword_mask: List[int] = []
+        # Parent-selection target (used only by --architecture mtl_parent):
+        # at each word's first subword, the subword position of its MWE parent's
+        # first subword, or its own position meaning "no parent".
+        parent_targets: List[int] = []
+        word_first_pos: Dict[int, int] = {}
 
         prev_word_idx = None
-        for word_idx in word_ids:
+        for pos, word_idx in enumerate(word_ids):
             if word_idx is None:
                 mwe_label_ids.append(self.mwe2id["O"])
                 sup_label_ids.append(-100)
                 first_subword_mask.append(0)
+                parent_targets.append(-100)
             elif word_idx != prev_word_idx:
                 mwe_label_ids.append(self.mwe2id.get(mwe_tags[word_idx], self.mwe2id["O"]))
                 sup = sup_tags[word_idx]
                 sup_label_ids.append(self.sup2id.get(sup, self.sup2id["O"]) if sup else self.sup2id["O"])
                 first_subword_mask.append(1)
+                word_first_pos[word_idx] = pos
+                parent_word = parents[word_idx] - 1  # 1-based -> 0-based; -1 means none
+                if 0 <= parent_word < word_idx and parent_word in word_first_pos:
+                    parent_targets.append(word_first_pos[parent_word])
+                else:
+                    parent_targets.append(pos)
             else:
                 mwe_label_ids.append(self.mwe2id["O"])
                 sup_label_ids.append(-100)
                 first_subword_mask.append(0)
+                parent_targets.append(-100)
             prev_word_idx = word_idx
 
         item = {key: val.squeeze(0) for key, val in encoding.items()}
@@ -177,6 +240,7 @@ class DiMSUMDataset(Dataset):
             torch.tensor(first_subword_mask, dtype=torch.bool),
             torch.tensor(mwe_label_ids, dtype=torch.long),
             torch.tensor(sup_label_ids, dtype=torch.long),
+            torch.tensor(parent_targets, dtype=torch.long),
         )
 
 
@@ -204,7 +268,7 @@ class LinearMultitaskTagger(nn.Module):
         self.mwe_loss_weight = mwe_loss_weight
         self.sup_loss_weight = sup_loss_weight
 
-    def forward(self, input_ids, attention_mask, first_subword_mask=None, mwe_tags=None, sup_tags=None):
+    def forward(self, input_ids, attention_mask, first_subword_mask=None, mwe_tags=None, sup_tags=None, parent_tags=None):
         out = self.encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
         out = self.dropout(out)
         out = out.to(self.mwe_head.weight.dtype)
@@ -252,6 +316,61 @@ class CRFMultitaskTagger(nn.Module):
         self.loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
         self.mwe_loss_weight = mwe_loss_weight
         self.sup_loss_weight = sup_loss_weight
+        # Constrained decoding (B+c). Training is unchanged; only Viterbi
+        # decoding is restricted to valid DiMSUM tag sequences.
+        self.constrained = False
+        self.register_buffer("allowed_trans", torch.ones(num_mwe_tags, num_mwe_tags, dtype=torch.bool), persistent=False)
+        self.register_buffer("allowed_start", torch.ones(num_mwe_tags, dtype=torch.bool), persistent=False)
+        self.register_buffer("allowed_end", torch.ones(num_mwe_tags, dtype=torch.bool), persistent=False)
+
+    def enable_constrained_decoding(self, id2mwe: Dict[int, str]) -> None:
+        """Mask invalid tag bigrams / start / end tags at decoding time."""
+        n = self.num_mwe_tags
+        trans = torch.zeros(n, n, dtype=torch.bool)
+        start = torch.zeros(n, dtype=torch.bool)
+        end = torch.zeros(n, dtype=torch.bool)
+        for a in range(n):
+            ta = id2mwe[a]
+            start[a] = ta in MWE_ALLOWED_START
+            end[a] = ta in MWE_ALLOWED_END
+            for b in range(n):
+                trans[a, b] = id2mwe[b] in MWE_ALLOWED_NEXT.get(ta, set())
+        device = self.crf.transitions.device
+        self.allowed_trans = trans.to(device)
+        self.allowed_start = start.to(device)
+        self.allowed_end = end.to(device)
+        self.constrained = True
+
+    def _constrained_viterbi(self, emissions: torch.Tensor, mask: torch.Tensor) -> List[List[int]]:
+        """Viterbi over the learned CRF scores with invalid transitions removed.
+        emissions: [B, L, K]; mask: [B, L] (contiguous prefix of True)."""
+        neg = -1e4
+        trans = self.crf.transitions.masked_fill(~self.allowed_trans, neg)
+        start = self.crf.start_transitions.masked_fill(~self.allowed_start, neg)
+        end = self.crf.end_transitions.masked_fill(~self.allowed_end, neg)
+        batch_size, seq_len, _ = emissions.shape
+        results: List[List[int]] = []
+        for b in range(batch_size):
+            length = int(mask[b].sum())
+            if length == 0:
+                results.append([])
+                continue
+            em = emissions[b, :length]
+            score = start + em[0]
+            backpointers = []
+            for t in range(1, length):
+                total = score.unsqueeze(1) + trans + em[t].unsqueeze(0)  # [prev, cur]
+                score, idx = total.max(dim=0)
+                backpointers.append(idx)
+            score = score + end
+            best = int(score.argmax())
+            path = [best]
+            for idx in reversed(backpointers):
+                best = int(idx[best])
+                path.append(best)
+            path.reverse()
+            results.append(path)
+        return results
 
     @staticmethod
     def _pack_crf_inputs(
@@ -287,7 +406,7 @@ class CRFMultitaskTagger(nn.Module):
 
         return packed_logits, packed_tags, packed_mask
 
-    def forward(self, input_ids, attention_mask, first_subword_mask=None, mwe_tags=None, sup_tags=None):
+    def forward(self, input_ids, attention_mask, first_subword_mask=None, mwe_tags=None, sup_tags=None, parent_tags=None):
         out = self.encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
         out = self.dropout(out)
         out = out.to(self.mwe_head.weight.dtype)
@@ -303,7 +422,10 @@ class CRFMultitaskTagger(nn.Module):
             mwe_tags,
         )
 
-        mwe_preds = self.crf.decode(crf_logits, mask=crf_mask)
+        if self.constrained:
+            mwe_preds = None if self.training else self._constrained_viterbi(crf_logits, crf_mask)
+        else:
+            mwe_preds = self.crf.decode(crf_logits, mask=crf_mask)
         sup_preds = torch.argmax(sup_logits, dim=-1)
 
         if mwe_tags is not None and sup_tags is not None:
@@ -316,6 +438,213 @@ class CRFMultitaskTagger(nn.Module):
             )
             return loss, mwe_preds, sup_preds
         return mwe_preds, sup_preds
+
+
+class ParentMultitaskTagger(nn.Module):
+    """
+    MWE identification as parent selection (condition G).
+
+    DiMSUM column 6 links every non-initial MWE token to the nearest preceding
+    token of the same MWE, so each MWE is a left-to-right chain. For every word
+    j the model scores each preceding word i as j's parent, plus "none"
+    (encoded as j pointing to itself), with a biaffine scorer over first-subword
+    encodings, and is trained with cross-entropy over these candidates.
+    Candidate parent-child links are scored directly as token pairs, instead of
+    being implied by a sequence of local tags.
+
+    The supersense head and loss are the same as in the CRF tagger.
+    """
+
+    def __init__(
+        self,
+        model_name: str,
+        num_sup_tags: int,
+        dropout: float = 0.1,
+        mwe_loss_weight: float = 1.0,
+        sup_loss_weight: float = 1.0,
+        arc_dim: int = 256,
+    ):
+        super().__init__()
+        transformers_logging.set_verbosity_error()
+        self.encoder = AutoModel.from_pretrained(model_name, use_safetensors=True).float()
+        transformers_logging.set_verbosity_warning()
+        hidden = self.encoder.config.hidden_size
+        self.dropout = nn.Dropout(dropout)
+        self.sup_head = nn.Linear(hidden, num_sup_tags)
+        self.child_mlp = nn.Sequential(nn.Linear(hidden, arc_dim), nn.GELU(), nn.Dropout(dropout))
+        self.parent_mlp = nn.Sequential(nn.Linear(hidden, arc_dim), nn.GELU(), nn.Dropout(dropout))
+        self.arc_weight = nn.Parameter(torch.zeros(arc_dim, arc_dim))
+        self.arc_parent_bias = nn.Linear(arc_dim, 1, bias=False)
+        nn.init.xavier_uniform_(self.arc_weight)
+        self.num_sup_tags = num_sup_tags
+        self.loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
+        self.mwe_loss_weight = mwe_loss_weight
+        self.sup_loss_weight = sup_loss_weight
+
+    def forward(self, input_ids, attention_mask, first_subword_mask=None, mwe_tags=None, sup_tags=None, parent_tags=None):
+        out = self.encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+        out = self.dropout(out)
+        out = out.to(self.sup_head.weight.dtype)
+        sup_logits = self.sup_head(out)
+        sup_preds = torch.argmax(sup_logits, dim=-1)
+
+        child = self.child_mlp(out)    # [B, T, d]
+        parent = self.parent_mlp(out)  # [B, T, d]
+        # scores[b, t, s] = score of position s being the parent of position t
+        scores = torch.einsum("btd,de,bse->bts", child, self.arc_weight, parent)
+        scores = scores + self.arc_parent_bias(parent).squeeze(-1).unsqueeze(1)
+
+        seq_len = input_ids.size(1)
+        if first_subword_mask is None:
+            first_subword_mask = attention_mask.bool()
+        positions = torch.arange(seq_len, device=input_ids.device)
+        earlier = positions.unsqueeze(0) < positions.unsqueeze(1)          # [T, T]: s < t
+        self_pos = positions.unsqueeze(0) == positions.unsqueeze(1)       # [T, T]: s == t ("none")
+        candidates = (earlier.unsqueeze(0) & first_subword_mask.unsqueeze(1)) | self_pos.unsqueeze(0)
+        scores = scores.masked_fill(~candidates, -1e4)
+        parent_logprobs = torch.log_softmax(scores, dim=-1)
+
+        if sup_tags is not None and parent_tags is not None:
+            arc_loss = self.loss_fn(scores.view(-1, seq_len), parent_tags.view(-1))
+            sup_loss = self.loss_fn(sup_logits.view(-1, self.num_sup_tags), sup_tags.view(-1))
+            loss = self.mwe_loss_weight * arc_loss + self.sup_loss_weight * sup_loss
+            return loss, parent_logprobs, sup_preds
+        return parent_logprobs, sup_preds
+
+
+def decode_parent_links(logprobs: torch.Tensor, valid_indices: torch.Tensor):
+    """
+    Turn parent-selection scores for one sentence into DiMSUM MWE tags.
+
+    logprobs: [T, T] log-probabilities (row = child position, column = parent
+              position; the diagonal is "none").
+    valid_indices: first-subword positions of the words, in order.
+
+    Steps:
+      1. Each word takes its highest-scoring parent (unconstrained top-1).
+      2. At most one child per parent: keep the highest-scoring child, set the
+         others to "none".
+      3. Structural constraint (DiMSUM): two MWEs may overlap in span only if
+         one lies entirely inside a single gap of the other and the inner one
+         is contiguous. On a violation, drop the lowest-scoring link among the
+         two MWEs and repeat.
+      4. Convert the remaining chains to O/o/B/b/I/i tags.
+
+    Returns (tags, log) where log records unconstrained links, final links,
+    removed links with reason and score margin, and the none rate.
+    """
+    pos = [int(p) for p in valid_indices]
+    n = len(pos)
+    lp = logprobs.detach().float().cpu()
+
+    parent: List[int] = [-1] * n
+    score: List[float] = [0.0] * n
+    none_score: List[float] = [0.0] * n
+    for j in range(n):
+        none_score[j] = float(lp[pos[j], pos[j]])
+        best_i, best_s = -1, none_score[j]
+        for i in range(j):
+            s = float(lp[pos[j], pos[i]])
+            if s > best_s:
+                best_i, best_s = i, s
+        parent[j], score[j] = best_i, best_s
+    unconstrained = list(parent)
+    removed: List[Dict[str, object]] = []
+
+    # 2. at most one child per parent
+    children: Dict[int, List[int]] = {}
+    for j, p in enumerate(parent):
+        if p >= 0:
+            children.setdefault(p, []).append(j)
+    for p, kids in children.items():
+        if len(kids) <= 1:
+            continue
+        keep = max(kids, key=lambda k: score[k])
+        for k in kids:
+            if k != keep:
+                removed.append({
+                    "child": k, "parent": p, "score": score[k], "none_score": none_score[k],
+                    "reason": "one_child", "retained_child": keep, "retained_score": score[keep],
+                    "margin": score[keep] - score[k], "cross_gap": k - p > 1,
+                })
+                parent[k] = -1
+
+    def build_groups() -> List[List[int]]:
+        child_of = {p: j for j, p in enumerate(parent) if p >= 0}
+        groups = []
+        for j in range(n):
+            if parent[j] == -1 and j in child_of:
+                chain = [j]
+                while chain[-1] in child_of:
+                    chain.append(child_of[chain[-1]])
+                groups.append(chain)
+        return groups
+
+    def inside_one_gap(inner: List[int], outer: List[int]) -> bool:
+        for a, b in zip(outer, outer[1:]):
+            if all(a < x < b for x in inner):
+                return True
+        return False
+
+    def contiguous(g: List[int]) -> bool:
+        return g[-1] - g[0] + 1 == len(g)
+
+    # 3. structural constraint
+    while True:
+        groups = build_groups()
+        violation = None
+        for gi in range(len(groups)):
+            for hi in range(gi + 1, len(groups)):
+                g, h = groups[gi], groups[hi]
+                if g[-1] < h[0] or h[-1] < g[0]:
+                    continue  # disjoint spans
+                ok = (inside_one_gap(h, g) and contiguous(h)) or (inside_one_gap(g, h) and contiguous(g))
+                if not ok:
+                    violation = (g, h)
+                    break
+            if violation:
+                break
+        if not violation:
+            break
+        g, h = violation
+        links = [k for k in g[1:] + h[1:]]  # children (each non-first member has one parent link)
+        worst = min(links, key=lambda k: score[k])
+        others = [k for k in links if k != worst]
+        removed.append({
+            "child": worst, "parent": parent[worst], "score": score[worst], "none_score": none_score[worst],
+            "reason": "structure",
+            "retained_min_score": min(score[k] for k in others) if others else None,
+            "margin": (min(score[k] for k in others) - score[worst]) if others else None,
+            "cross_gap": worst - parent[worst] > 1,
+        })
+        parent[worst] = -1
+
+    # 4. chains -> tags
+    groups = build_groups()
+    tags = ["O"] * n
+    inner_groups = [g for g in groups if any(inside_one_gap(g, o) for o in groups if o is not g)]
+    outer_groups = [g for g in groups if g not in inner_groups]
+    for g in outer_groups:
+        tags[g[0]] = "B"
+        for k in g[1:]:
+            tags[k] = "I"
+        members = set(g)
+        for k in range(g[0] + 1, g[-1]):
+            if k not in members:
+                tags[k] = "o"
+    for g in inner_groups:
+        tags[g[0]] = "b"
+        for k in g[1:]:
+            tags[k] = "i"
+
+    log = {
+        "n_words": n,
+        "unconstrained_parents": unconstrained,
+        "final_parents": list(parent),
+        "unconstrained_none": sum(1 for p in unconstrained if p < 0),
+        "removed": removed,
+    }
+    return tags, log
 
 
 def make_model(
@@ -345,6 +674,14 @@ def make_model(
             mwe_loss_weight,
             sup_loss_weight,
         )
+    if architecture == "mtl_parent":
+        return ParentMultitaskTagger(
+            model_name,
+            num_sup_tags,
+            dropout,
+            mwe_loss_weight,
+            sup_loss_weight,
+        )
     raise ValueError(f"Unknown architecture: {architecture}")
 
 
@@ -362,7 +699,11 @@ def train_one(
     epochs: int,
     lr: float,
     grad_clip: float,
+    on_epoch_end=None,
 ):
+    """Train for a fixed number of epochs. If on_epoch_end is given, it is
+    called after every epoch with (epoch, model) and may return a dict of
+    metrics that is merged into that epoch's loss_history row."""
     model.to(device)
     optimizer = AdamW(model.parameters(), lr=lr)
 
@@ -379,7 +720,7 @@ def train_one(
 
             optimizer.zero_grad(set_to_none=True)
 
-            loss, _, _ = model(*batch[:3], mwe_tags=batch[3], sup_tags=batch[4])
+            loss, _, _ = model(*batch[:3], mwe_tags=batch[3], sup_tags=batch[4], parent_tags=batch[5])
 
             loss.backward()
 
@@ -398,6 +739,8 @@ def train_one(
             "train_loss": avg_train_loss,
             "lr": optimizer.param_groups[0]["lr"],
         }
+        if on_epoch_end is not None:
+            row.update(on_epoch_end(epoch + 1, model) or {})
 
         loss_history.append(row)
 
@@ -419,7 +762,13 @@ def macro_f1(y_true, y_pred) -> float:
     return float(f1_score(y_true, y_pred, average="macro", zero_division=0))
 
 
-def decode_mwe_predictions(architecture: str, raw_preds, valid_indices: torch.Tensor, id2mwe: Dict[int, str]) -> List[str]:
+def decode_mwe_predictions(architecture: str, raw_preds, valid_indices: torch.Tensor, id2mwe: Dict[int, str],
+                           decode_logs: Optional[list] = None) -> List[str]:
+    if architecture == "mtl_parent":
+        tags, log = decode_parent_links(raw_preds, valid_indices)
+        if decode_logs is not None:
+            decode_logs.append(log)
+        return tags
     if architecture == "mtl_crf":
         return [id2mwe[raw_preds[j]] for j in range(len(valid_indices))]
     return [id2mwe[raw_preds[int(idx)]] for idx in valid_indices]
@@ -433,8 +782,8 @@ def evaluate_dev(model, loader, device, architecture: str, id2mwe: Dict[int, str
     with torch.no_grad():
         for batch in loader:
             batch = [x.to(device) for x in batch]
-            input_ids, attention_mask, first_mask, mwe_tags, sup_tags = batch
-            loss, mwe_preds, sup_preds = model(input_ids, attention_mask, first_mask, mwe_tags, sup_tags)
+            input_ids, attention_mask, first_mask, mwe_tags, sup_tags, parent_tags = batch
+            loss, mwe_preds, sup_preds = model(input_ids, attention_mask, first_mask, mwe_tags, sup_tags, parent_tags)
             total_loss += float(loss.item())
             for i in range(input_ids.size(0)):
                 valid_indices = torch.where(first_mask[i])[0]
@@ -656,33 +1005,47 @@ def write_prediction_file(
                     cols[5] = "0"
                     cols[6] = ""
                     cols[7] = sup if sup and sup != "O" else ""
+            else:
+                # Token beyond the model's predictions (sentence truncated at
+                # max_len): predict nothing, rather than copying the gold
+                # MWE/supersense columns through from the reference file.
+                cols[4] = "O"
+                cols[5] = "0"
+                cols[6] = ""
+                cols[7] = ""
 
             f_out.write("\t".join(cols) + "\n")
             word_idx += 1
 
 
-def predict_and_write(model, loader, device, architecture: str, id2mwe, id2sup, test_file: Path, pred_file: Path):
+def predict_and_write(model, loader, device, architecture: str, id2mwe, id2sup, test_file: Path, pred_file: Path,
+                      decode_logs: Optional[list] = None) -> Dict[str, int]:
+    """Predict, write a DiMSUM-format prediction file, and return diagnostics:
+    number of sentences whose raw MWE tag output was structurally invalid
+    (changed by clean_mwe_tags before writing)."""
     model.eval()
     all_mwe_preds: List[List[str]] = []
     all_sup_preds: List[List[Optional[str]]] = []
     with torch.no_grad():
         for batch in tqdm(loader, desc="predict"):
             batch = [x.to(device) for x in batch]
-            input_ids, attention_mask, first_mask, _, _ = batch
+            input_ids, attention_mask, first_mask = batch[:3]
             mwe_preds, sup_preds = model(input_ids, attention_mask, first_mask)
             for i in range(input_ids.size(0)):
                 valid_indices = torch.where(first_mask[i])[0]
-                all_mwe_preds.append(decode_mwe_predictions(architecture, mwe_preds[i], valid_indices, id2mwe))
+                all_mwe_preds.append(decode_mwe_predictions(architecture, mwe_preds[i], valid_indices, id2mwe, decode_logs))
                 raw_sup = [id2sup[int(sup_preds[i, idx])] for idx in valid_indices]
                 all_sup_preds.append([x if x != "O" else None for x in raw_sup])
+    invalid = sum(1 for tags in all_mwe_preds if clean_mwe_tags(tags) != list(tags))
     write_prediction_file(test_file, pred_file, all_mwe_preds, all_sup_preds)
+    return {"sentences": len(all_mwe_preds), "invalid_mwe_sentences_before_repair": invalid}
 
 
 def run_official_eval(eval_file: Optional[Path], gold_file: Path, pred_file: Path) -> str:
     if not eval_file or not eval_file.exists():
         return "Official evaluator not found; skipped."
 
-    cmd = ["python", str(eval_file), "-C", str(gold_file), str(pred_file)]
+    cmd = [sys.executable, str(eval_file), "-C", str(gold_file), str(pred_file)]
     result = subprocess.run(cmd, capture_output=True, text=True)
     output = result.stdout + result.stderr
 
@@ -772,7 +1135,12 @@ def main():
     parser.add_argument("--eval_file", type=Path, default=None)
     parser.add_argument("--output_dir", type=Path, default=Path("./runs"))
     parser.add_argument("--model_name", default="bert-base-uncased")
-    parser.add_argument("--architecture", choices=["linear", "mtl_crf"], default="linear")
+    parser.add_argument("--architecture", choices=["linear", "mtl_crf", "mtl_parent"], default="linear",
+                        help="mtl_crf = CRF MWE tagger (B); mtl_parent = parent-selection MWE head (G).")
+    parser.add_argument("--constrained_decoding", action="store_true",
+                        help="mtl_crf only: restrict Viterbi decoding to valid DiMSUM tag sequences (B+c).")
+    parser.add_argument("--no_dev_selection", action="store_true",
+                        help="Use the final epoch instead of the checkpoint with the best dev combined F.")
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=2e-5)
@@ -787,6 +1155,9 @@ def main():
     parser.add_argument("--mwe_loss_weight", type=float, default=1.0)
     parser.add_argument("--sup_loss_weight", type=float, default=1.0)
     args = parser.parse_args()
+    if args.constrained_decoding and args.architecture != "mtl_crf":
+        parser.error("--constrained_decoding requires --architecture mtl_crf")
+    dev_selection = not args.no_dev_selection
 
     if args.mount_drive:
         maybe_mount_drive()
@@ -816,6 +1187,9 @@ def main():
     print(f"test_file={test_file}")
     if not train_file.exists() or not test_file.exists():
         raise FileNotFoundError("Could not find train/test files. Set --data_dir or pass --train_file and --test_file.")
+    if dev_selection and (not args.eval_file or not Path(args.eval_file).exists()):
+        raise FileNotFoundError("Dev checkpoint selection needs the official evaluator; pass --eval_file "
+                                "(or --no_dev_selection to use the final epoch).")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=True)
     train_data = parse_dimsum_file(train_file)
@@ -826,17 +1200,30 @@ def main():
     print(f"mwe_labels={len(mwe2id)} sup_labels={len(sup2id)}")
 
     train_split, dev_split = split_train_dev(train_data, args.dev_split, args.seed)
+    # Same permutation applied to the raw lines, to write a DiMSUM-format dev gold file.
+    # (random.shuffle's permutation depends only on the seed and the list length.)
+    raw_train = parse_dimsum_raw(train_file)
+    assert len(raw_train) == len(train_data)
+    perm = list(range(len(raw_train)))
+    random.Random(args.seed).shuffle(perm)
+    split_at = int(len(perm) * (1.0 - args.dev_split))
+    dev_raw = [raw_train[k] for k in perm[split_at:]]
+    assert [len(b) for b in dev_raw] == [len(s_) for s_ in dev_split]
     train_loader = DataLoader(DiMSUMDataset(train_split, tokenizer, args.max_len, mwe2id, sup2id), batch_size=args.batch_size, shuffle=True)
     dev_loader = DataLoader(DiMSUMDataset(dev_split, tokenizer, args.max_len, mwe2id, sup2id), batch_size=args.batch_size, shuffle=False)
     test_loader = DataLoader(DiMSUMDataset(test_data, tokenizer, args.max_len, mwe2id, sup2id), batch_size=args.batch_size, shuffle=False)
 
     safe_model_name = args.model_name.replace("/", "__")
-    run_name = f"{args.architecture}_{safe_model_name}_lr{args.lr}_ep{args.epochs}_bs{args.batch_size}"
+    arch_tag = args.architecture + ("_cd" if args.constrained_decoding else "")
+    run_name = f"{arch_tag}_{safe_model_name}_lr{args.lr}_ep{args.epochs}_bs{args.batch_size}_seed{args.seed}"
     run_dir = args.output_dir / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     pred_file = run_dir / "predictions.pred"
     model_file = run_dir / "model.pt"
     label_file = run_dir / "labels.json"
+    dev_gold_file = run_dir / "dev.gold"
+    dev_pred_file = run_dir / "dev_epoch.pred"
+    write_dimsum_raw(dev_raw, dev_gold_file)
 
     with label_file.open("w", encoding="utf-8") as f:
         json.dump({"mwe2id": mwe2id, "sup2id": sup2id}, f, indent=2)
@@ -851,6 +1238,38 @@ def main():
         args.mwe_loss_weight,
         args.sup_loss_weight,
     )
+    if args.constrained_decoding:
+        model.enable_constrained_decoding(id2mwe)
+
+    # Checkpoint selection on dev (official scorer): keep the epoch with the
+    # highest dev combined F; ties -> higher dev supersense F; then earlier epoch.
+    best = {"epoch": None, "combined": None, "sup": None, "mwe": None}
+
+    def on_epoch_end(epoch: int, model_) -> Dict[str, float]:
+        if not dev_selection:
+            return {}
+        predict_and_write(model_, dev_loader, device, args.architecture, id2mwe, id2sup, dev_gold_file, dev_pred_file)
+        dev_scores = parse_official_scores(run_official_eval(args.eval_file, dev_gold_file, dev_pred_file))
+        # A missing score (e.g. no supersenses predicted -> F=nan) ranks lowest.
+        comb = dev_scores.get("official_combined_f1", float("-inf"))
+        sup = dev_scores.get("official_sup_f1", float("-inf"))
+        best_sup = best["sup"] if best["sup"] is not None else float("-inf")
+        improved = (best["combined"] is None or comb > best["combined"]
+                    or (comb == best["combined"] and sup > best_sup))
+        if improved:
+            best.update(epoch=epoch, combined=comb, sup=dev_scores.get("official_sup_f1"),
+                        mwe=dev_scores.get("official_mwe_f1"))
+            torch.save(model_.state_dict(), model_file)
+        print(f"epoch {epoch}: dev combined F={comb:.2f} sup F={dev_scores.get('official_sup_f1', float('nan')):.2f} "
+              f"MWE F={dev_scores.get('official_mwe_f1', float('nan')):.2f}"
+              f"{'  <- best so far' if improved else ''}")
+        return {
+            "dev_mwe_f1": dev_scores.get("official_mwe_f1"),
+            "dev_sup_f1": dev_scores.get("official_sup_f1"),
+            "dev_combined_f1": dev_scores.get("official_combined_f1"),
+            "selected_so_far": best["epoch"],
+        }
+
     model, loss_history = train_one(
         model,
         train_loader,
@@ -858,16 +1277,58 @@ def main():
         args.epochs,
         args.lr,
         args.grad_clip,
+        on_epoch_end=on_epoch_end,
     )
+    if dev_selection:
+        model.load_state_dict(torch.load(model_file, map_location=device))
+        print(f"selected epoch {best['epoch']} (dev combined F={best['combined']:.2f})")
+    else:
+        torch.save(model.state_dict(), model_file)
+
     dev_metrics = evaluate_dev(model, dev_loader, device, args.architecture, id2mwe, id2sup)
     print("dev_metrics=", dev_metrics)
 
-    torch.save(model.state_dict(), model_file)
-    predict_and_write(model, test_loader, device, args.architecture, id2mwe, id2sup, test_file, pred_file)
+    decode_logs: Optional[list] = [] if args.architecture == "mtl_parent" else None
+    pred_diag = predict_and_write(model, test_loader, device, args.architecture, id2mwe, id2sup, test_file, pred_file,
+                                  decode_logs=decode_logs)
     eval_text = run_official_eval(args.eval_file, test_file, pred_file)
     with (run_dir / "official_eval.txt").open("w", encoding="utf-8") as f:
         f.write(eval_text)
     print(eval_text)
+
+    # Exact-group gappy / contiguous scores (custom scorer).
+    try:
+        from gappy_eval import score as group_score, format_report as group_report
+        group_scores = group_score(test_file, pred_file)
+        (run_dir / "group_eval.json").write_text(json.dumps(group_scores, indent=2), encoding="utf-8")
+        print(group_report(group_scores))
+    except Exception as exc:  # pragma: no cover
+        group_scores = {"error": str(exc)}
+        print(f"group scorer failed: {exc}")
+
+    parent_diag = None
+    if decode_logs is not None:
+        with (run_dir / "parent_decode_log.jsonl").open("w", encoding="utf-8") as f:
+            for log in decode_logs:
+                f.write(json.dumps(log) + "\n")
+        removed = [r for log in decode_logs for r in log["removed"]]
+        words = sum(log["n_words"] for log in decode_logs)
+        unconstrained_links = sum(log["n_words"] - log["unconstrained_none"] for log in decode_logs)
+        final_links = sum(sum(1 for p in log["final_parents"] if p >= 0) for log in decode_logs)
+        parent_diag = {
+            "words": words,
+            "unconstrained_links": unconstrained_links,
+            "unconstrained_cross_gap_links": sum(
+                sum(1 for j, p in enumerate(log["unconstrained_parents"]) if p >= 0 and j - p > 1) for log in decode_logs),
+            "final_links": final_links,
+            "final_cross_gap_links": sum(
+                sum(1 for j, p in enumerate(log["final_parents"]) if p >= 0 and j - p > 1) for log in decode_logs),
+            "unconstrained_none_rate": round(1 - unconstrained_links / max(words, 1), 4),
+            "removed_one_child": sum(1 for r in removed if r["reason"] == "one_child"),
+            "removed_structure": sum(1 for r in removed if r["reason"] == "structure"),
+            "removed_cross_gap": sum(1 for r in removed if r["cross_gap"]),
+        }
+        print("parent decoding:", json.dumps(parent_diag))
 
     result = RunResult(
         architecture=args.architecture,
@@ -890,6 +1351,16 @@ def main():
         "grad_clip": args.grad_clip,
         "mwe_loss_weight": args.mwe_loss_weight,
         "sup_loss_weight": args.sup_loss_weight,
+        "seed": args.seed,
+        "constrained_decoding": args.constrained_decoding,
+        "dev_selection": dev_selection,
+        "selected_epoch": best["epoch"] if dev_selection else args.epochs,
+        "selected_dev_combined_f1": best["combined"],
+        "selected_dev_sup_f1": best["sup"],
+        "selected_dev_mwe_f1": best["mwe"],
+        "test_prediction_diagnostics": pred_diag,
+        "group_scores": group_scores,
+        "parent_decoding": parent_diag,
     }
     with (run_dir / "summary.json").open("w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
@@ -897,9 +1368,10 @@ def main():
     loss_csv = run_dir / "loss_history.csv"
     
     with loss_csv.open("w", encoding="utf-8") as f:
-        f.write("epoch,train_loss,lr\n")
+        f.write("epoch,train_loss,lr,dev_mwe_f1,dev_sup_f1,dev_combined_f1\n")
         for row in loss_history:
-            f.write(f"{row['epoch']},{row['train_loss']},{row['lr']}\n")
+            f.write(f"{row['epoch']},{row['train_loss']},{row['lr']},"
+                    f"{row.get('dev_mwe_f1', '')},{row.get('dev_sup_f1', '')},{row.get('dev_combined_f1', '')}\n")
 
 
 if __name__ == "__main__":
