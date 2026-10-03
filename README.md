@@ -113,14 +113,20 @@ only the MWE output differs.
 | B+c | `--architecture mtl_crf --constrained_decoding` | Same CRF; Viterbi restricted to valid tag sequences |
 | G | `--architecture mtl_parent` | Parent selection: each word scores every preceding word as its MWE parent (DiMSUM column 6) or "none"; chains are decoded under DiMSUM's structural constraints and converted back to tags |
 
-Run all three with the same settings (30 epochs; the best epoch is chosen on dev):
+Run all three with the same settings (30 epochs; the best epoch is chosen on dev).
+Each command is on one line so it works in bash and PowerShell:
 
 ```bash
-COMMON="--data_dir ./dimsum-data --eval_file ./dimsum-data/scripts/dimsumeval.py --model_name microsoft/deberta-v3-small --epochs 30 --batch_size 16 --lr 2e-5 --mwe_loss_weight 3 --sup_loss_weight 2 --seed 42"
-python dimsum_unified.py $COMMON --architecture mtl_crf
-python dimsum_unified.py $COMMON --architecture mtl_crf --constrained_decoding
-python dimsum_unified.py $COMMON --architecture mtl_parent
+python dimsum_unified.py --data_dir ./dimsum-data --eval_file ./dimsum-data/scripts/dimsumeval.py --model_name microsoft/deberta-v3-small --epochs 30 --batch_size 16 --lr 2e-5 --mwe_loss_weight 3 --sup_loss_weight 2 --seed 42 --architecture mtl_crf
+python dimsum_unified.py --data_dir ./dimsum-data --eval_file ./dimsum-data/scripts/dimsumeval.py --model_name microsoft/deberta-v3-small --epochs 30 --batch_size 16 --lr 2e-5 --mwe_loss_weight 3 --sup_loss_weight 2 --seed 42 --architecture mtl_crf --constrained_decoding
+python dimsum_unified.py --data_dir ./dimsum-data --eval_file ./dimsum-data/scripts/dimsumeval.py --model_name microsoft/deberta-v3-small --epochs 30 --batch_size 16 --lr 2e-5 --mwe_loss_weight 3 --sup_loss_weight 2 --seed 42 --architecture mtl_parent
 ```
+
+With Docker, prefix each command with `docker compose run --rm dimsum`, e.g.
+`docker compose run --rm dimsum python test_decoding.py`.
+
+Run folders: `runs/mtl_crf_microsoft__deberta-v3-small_lr2e-05_ep30_bs16_seed42/`,
+`runs/mtl_crf_cd_..._seed42/` (B+c) and `runs/mtl_parent_..._seed42/` (G).
 
 Before the full runs, `python test_decoding.py` (CPU, about a minute, needs `torch` and
 `pytorch-crf`) checks the decoders and the group scorer against the gold data.
